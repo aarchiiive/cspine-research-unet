@@ -10,6 +10,7 @@ from os import listdir
 from os.path import splitext, isfile, join
 from pathlib import Path
 from torch.utils.data import Dataset
+from torchvision import transforms
 from tqdm import tqdm
 import cv2
 import matplotlib.pyplot as plt
@@ -46,8 +47,18 @@ class BasicDataset(Dataset):
         self.scale = scale
         self.mask_suffix = mask_suffix
         self.cpu_count = 8
-
         self.ids = [splitext(file)[0] for file in listdir(images_dir) if isfile(join(images_dir, file)) and not file.startswith('.')]
+        self.transform = transforms.Compose([
+                        # transforms.Resize((input_size, input_size)),
+                        # transforms.ToTensor(),
+                        # transforms.RandomAffine(degrees=(-15, 15), translate=(0.05, 0.1)),
+                        # transforms.RandomResizedCrop(size=(input_size, input_size), scale=(0.75, 1.0)),
+                        transforms.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2, hue=0.2),
+                        # transforms.RandomErasing(),
+                        # transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
+                    ])
+        
+        
         print("id :", self.ids)
         print("mask_suffix :", mask_suffix)
         if not self.ids:
@@ -135,7 +146,7 @@ class BasicDataset(Dataset):
         # print(mask.shape)
         
         return {
-            'image': torch.as_tensor(img.copy()).float().contiguous(),
+            'image': self.transform(torch.as_tensor(img.copy()).float().contiguous()),
             'mask': torch.as_tensor(mask.copy()).long().contiguous()
         }
 
