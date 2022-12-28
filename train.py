@@ -25,6 +25,7 @@ dir_img = Path('./data/imgs/')
 dir_mask = Path('./data/masks/')
 dir_checkpoint = Path('./checkpoints/')
 
+pred_count = 0
 
 def train_model(
         model,
@@ -40,6 +41,8 @@ def train_model(
         momentum: float = 0.999,
         gradient_clipping: float = 1.0,
 ):
+    global pred_count
+    
     # 1. Create dataset
     try:
         dataset = CarvanaDataset(dir_img, dir_mask, img_scale)
@@ -74,7 +77,7 @@ def train_model(
         Images scaling:  {img_scale}
         Mixed Precision: {amp}
     ''')
-
+    
     # 4. Set up the optimizer, the loss, the learning rate scheduler and the loss scaling for AMP
     optimizer = optim.RMSprop(model.parameters(),
                               lr=learning_rate, weight_decay=weight_decay, momentum=momentum, foreach=True)
@@ -83,6 +86,10 @@ def train_model(
     criterion = nn.CrossEntropyLoss() if model.n_classes > 1 else nn.BCEWithLogitsLoss()
     global_step = 0
 
+    if not os.path.isdir("outputs"):
+        os.mkdir("outputs")
+        os.mkdir("outputs/preds")
+    
     # 5. Begin training
     for epoch in range(1, epochs + 1):
         model.train()
@@ -101,11 +108,25 @@ def train_model(
 
                 with torch.autocast(device.type if device.type != 'mps' else 'cpu', enabled=amp):
                     masks_pred = model(images)
-
+                    
+                    origin = np.asarray(TF.to_pil_image(true_masks[0].float().cpu()))
+                    origin[origin > 0] = 255
+                    origin = cv2.cvtColor(origin, cv2.COLOR_GRAY2BGR)
+                    
+                    # normalize
+                    # pred = masks_pred.squeeze(0)
+                    # pred -= pred.min(1, keepdim=True)[0]
+                    # pred /= pred.max(1, keepdim=True)[0]
+                    
+                    # threshold
                     pred = torch.where(masks_pred > 0, 1, 0).squeeze(0)
                     pred = np.asarray(TF.to_pil_image(pred.float().cpu()))
                     pred = cv2.cvtColor(pred, cv2.COLOR_GRAY2BGR)
-                    cv2.imwrite("samples/pred.jpg", pred)
+                    
+                    # concatenate
+                    res = np.concatenate((origin, pred), axis=1)
+                    cv2.imwrite("outputs/preds/{}.jpg".format(pred_count), res)
+                    pred_count += 1
                 
                     if model.n_classes == 1:
                         loss = criterion(masks_pred.squeeze(1), true_masks.float())
@@ -153,19 +174,28 @@ def train_model(
 
                         logging.info('Validation Dice score: {}'.format(val_score))
                         try:
-                            experiment.log({
-                                'learning rate': optimizer.param_groups[0]['lr'],
-                                'validation Dice': val_score,
-                                'images': wandb.Image(images[0].cpu()),
-                                'masks': {
-                                    'true': wandb.Image(true_masks[0].float().cpu()),
-                                    'pred': wandb.Image(pred),
-                                    # 'pred': wandb.Image(masks_pred.argmax(dim=1)[0].float().cpu()),
-                                },
-                                'step': global_step,
-                                'epoch': epoch,
-                                # **histograms
-                            })
+                            if global_step < len(dataset) * 5 or global_step % 20 == 0:
+                                experiment.log({
+                                    'learning rate': optimizer.param_groups[0]['lr'],
+                                    'validation Dice': val_score,
+                                    'images': wandb.Image(images[0].cpu()),
+                                    'masks': {
+                                        'true': wandb.Image(true_masks[0].float().cpu()),
+                                        'pred': wandb.Image(pred),
+                                        # 'pred': wandb.Image(masks_pred.argmax(dim=1)[0].float().cpu()),
+                                    },
+                                    'step': global_step,
+                                    'epoch': epoch,
+                                    # **histograms
+                                })
+                            else:
+                                experiment.log({
+                                    'learning rate': optimizer.param_groups[0]['lr'],
+                                    'validation Dice': val_score,
+                                    'step': global_step,
+                                    'epoch': epoch,
+                                    # **histograms
+                                })
                         except:
                             pass
 
