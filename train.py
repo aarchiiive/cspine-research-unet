@@ -1,6 +1,7 @@
 import argparse
 import logging
 import os
+import gc
 import random
 import sys
 import cv2
@@ -12,6 +13,8 @@ import torchvision.transforms.functional as TF
 from pathlib import Path
 from torch import optim
 from torch.utils.data import DataLoader, random_split
+import torch.cuda.comm
+import psutil
 from tqdm import tqdm
 import numpy as np
 
@@ -25,8 +28,6 @@ dir_img = Path('./data/imgs/')
 dir_mask = Path('./data/masks/')
 dir_checkpoint = Path('./checkpoints/')
 
-pred_count = 0
-
 def train_model(
         model,
         device,
@@ -37,17 +38,23 @@ def train_model(
         save_checkpoint: bool = True,
         img_scale: float = 0.5,
         amp: bool = False,
+        opt: str = "rmsprop",
         weight_decay: float = 1e-8,
         momentum: float = 0.999,
         gradient_clipping: float = 1.0,
+        save: str = None,
+        export: str = "sigmoid",
+        augment: str = None,
+        project_name: str = None
+
 ):
-    global pred_count
+    pred_count = 0
     
     # 1. Create dataset
     try:
-        dataset = CarvanaDataset(dir_img, dir_mask, img_scale)
+        dataset = CarvanaDataset(dir_img, dir_mask, img_scale, augment=augment)
     except (AssertionError, RuntimeError):
-        dataset = BasicDataset(dir_img, dir_mask, img_scale)
+        dataset = BasicDataset(dir_img, dir_mask, img_scale, augment=augment)
 
     # 2. Split into train / validation partitions
     n_val = int(len(dataset) * val_percent)
@@ -60,10 +67,11 @@ def train_model(
     val_loader = DataLoader(val_set, shuffle=False, drop_last=True, **loader_args)
 
     # (Initialize logging)
-    experiment = wandb.init(project='cspine-research-unet', resume='allow', anonymous='must')
+    experiment = wandb.init(project='cspine-research-unet', name=project_name, resume='allow')
     experiment.config.update(
         dict(epochs=epochs, batch_size=batch_size, learning_rate=learning_rate,
-             val_percent=val_percent, save_checkpoint=save_checkpoint, img_scale=img_scale, amp=amp)
+             val_percent=val_percent, save_checkpoint=save_checkpoint, img_scale=img_scale, amp=amp,
+             optimizer=opt, weight_decay=weight_decay)
     )
 
     logging.info(f'''Starting training:
@@ -79,16 +87,25 @@ def train_model(
     ''')
     
     # 4. Set up the optimizer, the loss, the learning rate scheduler and the loss scaling for AMP
-    optimizer = optim.RMSprop(model.parameters(),
+    # optimizer 선택하기
+    if opt == "rmsprop":
+        optimizer = optim.RMSprop(model.parameters(),
                               lr=learning_rate, weight_decay=weight_decay, momentum=momentum, foreach=True)
+    elif opt == "adam":
+        optimizer = optim.Adam(model.parameters(), lr=learning_rate, eps=1e-8, weight_decay=weight_decay, foreach=True)
+
     scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, 'max', patience=5)  # goal: maximize Dice score
     grad_scaler = torch.cuda.amp.GradScaler(enabled=amp)
-    criterion = nn.CrossEntropyLoss() if model.n_classes > 1 else nn.BCEWithLogitsLoss()
+    criterion = nn.CrossEntropyLoss() if model.module.n_classes > 1 else nn.BCEWithLogitsLoss()
     global_step = 0
 
     if not os.path.isdir("outputs"):
         os.mkdir("outputs")
-        os.mkdir("outputs/preds")
+    if not os.path.isdir("checkpoints"):
+        os.mkdir("checkpoints")
+    if not os.path.isdir(os.path.join("outputs", save)):
+        os.mkdir(os.path.join("outputs", save))
+        os.mkdir(os.path.join("checkpoints", save))
     
     # 5. Begin training
     for epoch in range(1, epochs + 1):
@@ -98,8 +115,8 @@ def train_model(
             for batch in train_loader:
                 images, true_masks = batch['image'], batch['mask']
 
-                assert images.shape[1] == model.n_channels, \
-                    f'Network has been defined with {model.n_channels} input channels, ' \
+                assert images.shape[1] == model.module.n_channels, \
+                    f'Network has been defined with {model.module.n_channels} input channels, ' \
                     f'but loaded images have {images.shape[1]} channels. Please check that ' \
                     'the images are loaded correctly.'
 
@@ -109,33 +126,37 @@ def train_model(
                 with torch.autocast(device.type if device.type != 'mps' else 'cpu', enabled=amp):
                     masks_pred = model(images)
                     
-                    origin = np.asarray(TF.to_pil_image(true_masks[0].float().cpu()))
+                    # 실제 직접 labeling한 mask(정답)
+                    origin = np.asarray(TF.to_pil_image(true_masks[0].float().cpu())).copy()
                     origin[origin > 0] = 255
-                    origin = cv2.cvtColor(origin, cv2.COLOR_GRAY2BGR)
+                    origin = cv2.cvtColor(origin, cv2.COLOR_GRAY2BGR) # color channel이 1개이므로 BGR로 변환
                     
-                    # normalize
-                    # pred = masks_pred.squeeze(0)
-                    # pred -= pred.min(1, keepdim=True)[0]
-                    # pred /= pred.max(1, keepdim=True)[0]
+                    # visualize할 방법 선택하기
+                    if export == "sigmoid":
+                        pred = torch.sigmoid(masks_pred)
+                        pred = torch.where(pred > 0.5, 1, 0).squeeze(0)
+                    elif export == "mean":
+                        m = torch.mean(torch.where(masks_pred > 0, masks_pred, 0))
+                        pred = torch.where(masks_pred > m, 1, 0).squeeze(0)
+
+                    # 모델이 예측한 mask(예측)
+                    pred = np.asarray(TF.to_pil_image(pred.float().cpu())).copy()
+                    pred = cv2.cvtColor(pred, cv2.COLOR_GRAY2BGR) # color channel이 1개이므로 BGR로 변환
                     
-                    # threshold
-                    pred = torch.where(masks_pred > 0, 1, 0).squeeze(0)
-                    pred = np.asarray(TF.to_pil_image(pred.float().cpu()))
-                    pred = cv2.cvtColor(pred, cv2.COLOR_GRAY2BGR)
-                    
-                    # concatenate
-                    res = np.concatenate((origin, pred), axis=1)
-                    cv2.imwrite("outputs/preds/{}.jpg".format(pred_count), res)
+                    # concatenate (두 사진을 가로로 합치기)
+                    # res = np.concatenate((origin, pred), axis=1)
+                    # cv2.imwrite(os.path.join("outputs", save, f"{pred_count}.jpg"), res)
                     pred_count += 1
-                
-                    if model.n_classes == 1:
+
+                    # loss 계산하기 -> 현재 학습에서는 class가 한가지
+                    if model.module.n_classes == 1:
                         loss = criterion(masks_pred.squeeze(1), true_masks.float())
                         loss += dice_loss(F.sigmoid(masks_pred.squeeze(1)), true_masks.float(), multiclass=False)
                     else:
                         loss = criterion(masks_pred, true_masks)
                         loss += dice_loss(
                             F.softmax(masks_pred, dim=1).float(),
-                            F.one_hot(true_masks, model.n_classes).permute(0, 3, 1, 2).float(),
+                            F.one_hot(true_masks, model.module.n_classes).permute(0, 3, 1, 2).float(),
                             multiclass=True
                         )
 
@@ -161,6 +182,7 @@ def train_model(
                 division_step = (n_train // (5 * batch_size))
                 if division_step > 0:
                     if global_step % division_step == 0:
+
                         # histograms = {}
                         # for tag, value in model.named_parameters():
                         #     tag = tag.replace('/', '.')
@@ -174,7 +196,7 @@ def train_model(
 
                         logging.info('Validation Dice score: {}'.format(val_score))
                         try:
-                            if global_step < len(dataset) * 5 or global_step % 20 == 0:
+                            if global_step % 5 == 0:
                                 experiment.log({
                                     'learning rate': optimizer.param_groups[0]['lr'],
                                     'validation Dice': val_score,
@@ -199,11 +221,11 @@ def train_model(
                         except:
                             pass
 
-        if save_checkpoint and epoch % 10 == 0:
+        if save_checkpoint and epoch % 5 == 4:
             Path(dir_checkpoint).mkdir(parents=True, exist_ok=True)
-            state_dict = model.state_dict()
+            state_dict = model.module.state_dict()
             state_dict['mask_values'] = dataset.mask_values
-            torch.save(state_dict, str(dir_checkpoint / 'checkpoint_epoch{}.pth'.format(epoch)))
+            torch.save(state_dict, os.path.join("checkpoints", save, 'checkpoint_epoch{}.pth'.format(epoch)))
             logging.info(f'Checkpoint {epoch} saved!')
 
 # python main.py train --epochs 10
@@ -224,8 +246,13 @@ def get_args():
 
     return parser.parse_args()
 
+def train(save: str = None,
+          opt: str = "rmsprop",
+          weight_decay: float = 1e-8,
+          export="sigmoid",
+          augment=None):
 
-if __name__ == '__main__':
+    save = "-".join([export, opt, str(weight_decay)])
     args = get_args()
 
     logging.basicConfig(level=logging.INFO, format='%(levelname)s: %(message)s')
@@ -250,31 +277,44 @@ if __name__ == '__main__':
         model.load_state_dict(state_dict)
         logging.info(f'Model loaded from {args.load}')
 
-    model.to(device=device)
-    try:
-        train_model(
-            model=model,
-            epochs=args.epochs,
-            batch_size=args.batch_size,
-            learning_rate=args.lr,
-            device=device,
-            img_scale=args.scale,
-            val_percent=args.val / 100,
-            amp=args.amp
-        )
-    except torch.cuda.OutOfMemoryError:
-        logging.error('Detected OutOfMemoryError! '
-                      'Enabling checkpointing to reduce memory usage, but this slows down training. '
-                      'Consider enabling AMP (--amp) for fast and memory efficient training')
-        torch.cuda.empty_cache()
-        model.use_checkpointing()
-        train_model(
-            model=model,
-            epochs=args.epochs,
-            batch_size=args.batch_size,
-            learning_rate=args.lr,
-            device=device,
-            img_scale=args.scale,
-            val_percent=args.val / 100,
-            amp=args.amp
-        )
+    if torch.cuda.device_count() > 1:
+        print("Training with multiple devices")
+        model = torch.nn.DataParallel(model, device_ids=range(torch.cuda.device_count()))
+
+    # model을 device에 올리기
+    model = model.to(device)
+
+    gc.collect()
+    torch.cuda.empty_cache()
+
+    train_model(
+        model=model,
+        epochs=args.epochs,
+        batch_size=args.batch_size,
+        learning_rate=args.lr,
+        device=device,
+        img_scale=args.scale,
+        val_percent=args.val / 100,
+        amp=args.amp,
+        weight_decay=weight_decay,
+        save=save,
+        project_name=save,
+        augment=augment
+    )
+
+    wandb.finish(quiet=True)
+
+if __name__ == '__main__':
+    train(opt="rmsprop", weight_decay=1e-8, export="sigmoid")
+    # train(opt="rmsprop", weight_decay=1e-7, export="sigmoid")
+    # train(opt="rmsprop", weight_decay=1e-6, export="sigmoid")
+    # train(opt="rmsprop", weight_decay=1e-8, export="mean")
+    # train(opt="rmsprop", weight_decay=1e-7, export="mean")
+    # train(opt="rmsprop", weight_decay=1e-6, export="mean")
+
+    # train(opt="adam", weight_decay=1e-8, export="sigmoid")
+    # train(opt="adam", weight_decay=1e-7, export="sigmoid")
+    # train(opt="adam", weight_decay=1e-6, export="sigmoid")
+    # train(opt="adam", weight_decay=1e-8, export="mean")
+    # train(opt="adam", weight_decay=1e-7, export="mean")
+    # train(opt="adam", weight_decay=1e-6, export="mean")
