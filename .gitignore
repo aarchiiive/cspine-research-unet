@@ -4,4 +4,6 @@
 /wandb
 /utils/__pycache__
 /unet/__pycache__
-/__pycache__
+/__pycache__\
+/outputs
+cmd.txt

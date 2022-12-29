@@ -40,7 +40,7 @@ def unique_mask_values(idx, mask_dir, mask_suffix):
 count = 0
 
 class BasicDataset(Dataset):
-    def __init__(self, images_dir: str, mask_dir: str, scale: float = 1.0, mask_suffix: str = ''):
+    def __init__(self, images_dir: str, mask_dir: str, scale: float = 1.0, mask_suffix: str = '', augment: str = ""):
         self.images_dir = Path(images_dir)
         self.mask_dir = Path(mask_dir)
         assert 0 < scale <= 1, 'Scale must be between 0 and 1'
@@ -52,13 +52,13 @@ class BasicDataset(Dataset):
                         # transforms.Resize((input_size, input_size)),
                         # transforms.ToTensor(),
                         # transforms.RandomAffine(degrees=(-15, 15), translate=(0.05, 0.1)),
-                        # transforms.RandomResizedCrop(size=(input_size, input_size), scale=(0.75, 1.0)),
+                        # transforms.RandomResizedCrop(size=(512, 512), scale=(0.75, 1.0)),
                         transforms.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2, hue=0.2),
                         # transforms.RandomErasing(),
                         # transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
                     ])
-        
-        
+        self.augment = augment
+
         print("id :", self.ids)
         print("mask_suffix :", mask_suffix)
         if not self.ids:
@@ -66,6 +66,7 @@ class BasicDataset(Dataset):
 
         logging.info(f'Creating dataset with {len(self.ids)} examples')
         logging.info('Scanning mask files to determine unique values')
+        
         # with Pool() as p:
         #     unique = list(tqdm(
         #         p.imap(partial(unique_mask_values, mask_dir=self.mask_dir, mask_suffix=self.mask_suffix), self.ids),
@@ -75,8 +76,6 @@ class BasicDataset(Dataset):
         unique = []
         for i in range(len(self.ids)):
             unique.append(unique_mask_values(self.ids[i], self.mask_dir, self.mask_suffix)) 
-            # print(unique[-1])
-            # print(np.shape(unique[-1]))
         
         self.mask_values = list(sorted(np.unique(np.concatenate(unique), axis=0).tolist()))
         logging.info(f'Unique mask values: {self.mask_values}')
@@ -98,7 +97,6 @@ class BasicDataset(Dataset):
             newW, newH = pil_img.size
 
         img = np.asarray(pil_img)
-        # print(np.shape(img))
 
         if is_mask:
             mask = np.zeros((newH, newW), dtype=np.int64)
@@ -133,9 +131,6 @@ class BasicDataset(Dataset):
         mask = load_image(mask_file[0])
         img = load_image(img_file[0])
         
-        # img.save("samples/img.jpg", "jpeg")
-        # mask.save("samples/mask.jpg", "jpeg")
-        
         assert img.size == mask.size, \
             f'Image and mask {name} should be the same size, but are {img.size} and {mask.size}'
 
@@ -144,13 +139,23 @@ class BasicDataset(Dataset):
 
         # print(img.shape)
         # print(mask.shape)
+        # img = torch.as_tensor(img.copy()).float().contiguous()
+        # mask = torch.as_tensor(mask.copy()).float().contiguous()
+        # pair = torch.cat((img, mask), dim=2)
+        # pair = self.transform(pair)
+        # print(pair.shape)
         
+        # return {
+        #     'image': pair[0],
+        #     'mask': pair[1]
+        # }
+
         return {
-            'image': self.transform(torch.as_tensor(img.copy()).float().contiguous()),
-            'mask': torch.as_tensor(mask.copy()).long().contiguous()
+            'image': torch.as_tensor(img.copy()).float().contiguous(),
+            'mask': torch.as_tensor(mask.copy()).float().contiguous()
         }
 
 
 class CarvanaDataset(BasicDataset):
-    def __init__(self, images_dir, mask_dir, scale=1):
-        super().__init__(images_dir, mask_dir, scale, mask_suffix='_mask')
+    def __init__(self, images_dir, mask_dir, scale=1, augment=""):
+        super().__init__(images_dir, mask_dir, scale, mask_suffix='_mask', augment="")
