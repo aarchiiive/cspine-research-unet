@@ -18,7 +18,7 @@ python train.py --epochs 10
 ```
 
 ## Weights & Biases
-[자신의 API key 확인하기](https://app.wandb.ai/authorize)
+wandb를 사용하기 위해서는 먼저 login을 한 상태여야 합니다. [[자신의 API key 확인하기](https://app.wandb.ai/authorize)]
 ```
 wandb login [user API Key]
 ```
